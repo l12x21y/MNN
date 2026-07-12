@@ -1,13 +1,3 @@
-> This project is a modified version based on:
-> Original repository: https://github.com/GanchengZhu/GazeFollower
->
-> The original work is created by Gancheng Zhu et al. and licensed under
-> Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0).
->
-> Modifications in this version are made for academic research purposes.
-
----
-
 <div align="center">
   <a href="https://github.com/GanchengZhu/GazeFollower">
     <img width="160" height="160" src="https://raw.githubusercontent.com/GanchengZhu/GazeFollower/main/gazefollower/res/image/gazefollower.png">
