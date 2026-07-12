@@ -1,5 +1,4 @@
 import math
-import os
 import os.path
 import pathlib
 
@@ -34,63 +33,21 @@ class BlazeFaceAlignment(FaceAlignment):
         else:
             self.model_path = pathlib.Path(model_path).resolve()
 
-        # MNN 后端选择: 与眼动估计器保持一致, 读取 GAZEFOLLOWER_MNN_BACKEND
-        # (0=CPU, 2=OpenCL, 4=Vulkan)。未设置时默认 Vulkan(4), 失败回退 CPU(0)。
-        # 这样人脸对齐就能和眼动一样跑在 GPU 上, 把脸检测从 CPU 挪走, 缓解播放卡顿。
-        env_b = os.environ.get("GAZEFOLLOWER_MNN_BACKEND")
-        if env_b is not None:
-            try:
-                candidates = [int(env_b)]
-                if int(env_b) != 0:
-                    candidates.append(0)  # 指定非 CPU 后端失败时回退 CPU
-            except ValueError:
-                candidates = [4, 0]
-        else:
-            candidates = [4, 0]  # Vulkan(GPU) -> CPU
-
-        self.backend = None
-        last_err = None
-        for b in candidates:
-            try:
-                config = {'precision': 'low', 'backend': b, 'numThread': 4}
-                rt = MNN.nn.create_runtime_manager((config,))
-                module = MNN.nn.load_module_from_file(
-                    str(self.model_path),
-                    ["image", "conf_threshold", "max_detections", "iou_threshold"],
-                    ["selectedBoxes"],
-                    runtime_manager=rt,
-                )
-                self._self_test(module)  # 零输入跑一次前向, 确认该后端真的能推理
-                self.face_detector = module
-                self.backend = b
-                Log.i(f"BlazeFace 使用后端 backend={b} ({'GPU' if b != 0 else 'CPU'})")
-                break
-            except Exception as e:
-                last_err = e
-                Log.w(f"BlazeFace MNN 后端 {b} 不可用, 尝试下一个: {e}")
-        if self.backend is None:
-            raise RuntimeError(f"BlazeFace MNN 所有候选后端均初始化失败: {last_err}")
+        # Load MNN model (original default backend: CPU=0)
+        config = {'precision': 'low', 'backend': 0, 'numThread': 4}
+        rt = MNN.nn.create_runtime_manager((config,))
+        self.face_detector = MNN.nn.load_module_from_file(
+            str(self.model_path),
+            ["image", "conf_threshold", "max_detections", "iou_threshold"],
+            ["selectedBoxes"],
+            runtime_manager=rt,
+        )
 
         # Define vertex indices for lip and eye regions (kept for compatibility)
         self.lip_vertices_index = [61, 91, 14, 178, 402, 324, 95]
         self.left_vertices_index = [33, 246, 161, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7, 33]
         self.right_vertices_index = [362, 388, 384, 385, 386, 387, 388, 466, 263, 249, 380, 373, 374, 380, 381, 382,
                                      362]
-
-    def _self_test(self, module):
-        """
-        用全零输入跑一次前向, 验证该后端(或回退后的 CPU)真的能推理。
-        避免 MNN 在请求 GPU 后端时"静默回退到 CPU"却无报错的情况。
-        """
-        img = np.zeros((1, 128, 128, 3), np.float32)
-        iv = MNN.expr.placeholder([1, 128, 128, 3], MNN.expr.NHWC)
-        iv.write(img)
-        cv = MNN.expr.const([self.min_confidence], [1], MNN.expr.NCHW, MNN.expr.dtype.float)
-        mv = MNN.expr.const([float(self.max_num_faces)], [1], MNN.expr.NCHW, MNN.expr.dtype.float)
-        iov = MNN.expr.const([self.min_iou_thresh], [1], MNN.expr.NCHW, MNN.expr.dtype.float)
-        outs = module.onForward([iv, cv, mv, iov])
-        if not outs or len(outs) == 0 or len(outs[0]) == 0:
-            raise RuntimeError("BlazeFace 自检前向无输出")
 
     @staticmethod
     def calculate_polygon_area(vertices) -> float:
@@ -105,29 +62,6 @@ class BlazeFaceAlignment(FaceAlignment):
         x = vertices[:, 0]
         y = vertices[:, 1]
         return 0.5 * np.abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
-
-    @staticmethod
-    def _eye_openness(image_rgb, rect):
-        """
-        从眼区图像估计睁眼度: 统计明显比局部均值暗的像素数(瞳孔/上眼睑阴影)。
-        睁眼(有瞳孔)该计数远大于闭眼(均匀肤色), 从而能被 eye_blink_threshold 区分。
-        """
-        try:
-            x, y, w, h = [int(v) for v in rect]
-            if w <= 0 or h <= 0:
-                return 0.0
-            patch = image_rgb[y:y + h, x:x + w]
-            if patch.size == 0 or patch.ndim != 3:
-                return 0.0
-            gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)
-            mean = float(gray.mean())
-            if mean <= 1.0:
-                return 0.0
-            # 比局部均值暗超过 25% 的像素数
-            dark = int((gray < mean * 0.75).sum())
-            return float(dark)
-        except Exception:
-            return 0.0
 
     @staticmethod
     def _crop_img(img, X, Y, W, H):
@@ -203,16 +137,15 @@ class BlazeFaceAlignment(FaceAlignment):
 
         Args:
             timestamp: A timestamp indicating when the image was captured.
-            image: The image in which to detect faces, expected in RGB format.
+            image: The image in which to detect faces, expected in BGR format.
         Returns:
             An instance of FaceInfo containing details about the detected face.
         """
         face_info = FaceInfo()
         face_info.timestamp = timestamp
 
-        # 输入已为 RGB(WebCamCamera.capture 已做 BGR->RGB), 与 MediaPipeFaceAlignment 保持一致,
-        # 不要再二次转换, 否则颜色通道错位会导致检测精度下降。
-        image_rgb = image
+        # Convert BGR to RGB (OpenCV default is BGR)
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image_height, image_width, _ = image.shape
         face_info.img_w = image_width
         face_info.img_h = image_height
@@ -306,12 +239,9 @@ class BlazeFaceAlignment(FaceAlignment):
         #
         # face_info.face_landmarks = full_face_mesh
 
-        # Calculate eye openness (real, derived from eye-region image)
-        # 用真实眼区图像估计睁眼度: 睁眼时瞳孔呈暗色 -> 明显比局部均值暗的像素更多;
-        # 闭眼时眼睑闭合 -> 眼区近似均匀肤色 -> 暗像素≈0。这样校准时的
-        # eye_blink_threshold(默认 10)仍能正确剔除眨眼帧, 不会被写死常量绕过。
-        face_info.left_eye_openness = self._eye_openness(image_rgb, face_info.left_rect)
-        face_info.right_eye_openness = self._eye_openness(image_rgb, face_info.right_rect)
+        # Calculate eye openness (placeholder default)
+        face_info.left_eye_openness = 100
+        face_info.right_eye_openness = 100
 
         face_info.status = True
         face_info.can_gaze_estimation = True
