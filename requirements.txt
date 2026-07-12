@@ -1,0 +1,7 @@
+mediapipe==0.10.14
+MNN
+numpy
+opencv-python
+pandas
+pygame
+screeninfo
