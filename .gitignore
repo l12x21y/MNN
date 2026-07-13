@@ -34,3 +34,7 @@ gazefollower/res/model_weights/base.mnn
 gaze_*/
 # Windows 误生成的设备名文件
 nul
+
+# WorkBuddy 内部数据(非项目文件, 不应入库)
+.learnbuddy/
+.workbuddy/
