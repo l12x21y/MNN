@@ -31,7 +31,7 @@ import sys, json, gc
 import numpy as np
 import MNN
 model = sys.argv[1]
-backends = [2, 4, 5, 1, 0]
+backends = [6, 2, 4, 5, 1, 0]  # CUDA(6) → OpenCL(2) → Vulkan(4) → Metal(5) → OpenCL-macOS(1) → CPU(0)
 if sys.platform != "darwin":
     backends = [b for b in backends if b != 1]
 res = {}
@@ -114,12 +114,15 @@ def probe_all(model_path):
                 res = {}
             break
     info = {}
-    for b in (2, 4, 5, 1, 0):
+    for b in (6, 2, 4, 5, 1, 0):
         ok = bool(res.get(str(b), False))
         fell_back = (b != 0) and ("Can't Find type=%d" % b in out)
         info[b] = {"ok": ok, "fell_back": fell_back}
     if 1 in info and sys.platform != "darwin":
         del info[1]
+    # macOS 没有 CUDA (6), 移除以避免误报
+    if sys.platform == "darwin" and 6 in info:
+        del info[6]
     return info
 
 

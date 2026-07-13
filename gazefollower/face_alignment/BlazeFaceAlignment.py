@@ -7,7 +7,6 @@ import cv2
 import numpy as np
 
 from gazefollower.face_alignment import FaceAlignment
-from gazefollower.logger import Log
 from gazefollower.misc import FaceInfo
 
 
@@ -32,16 +31,19 @@ class BlazeFaceAlignment(FaceAlignment):
             self.model_path = pathlib.Path(__file__).parent.parent / "res/model_weights/blaze_face.mnn"
         else:
             self.model_path = pathlib.Path(model_path).resolve()
-
-        # Load MNN model (original default backend: CPU=0)
-        config = {'precision': 'low', 'backend': 0, 'numThread': 4}
-        rt = MNN.nn.create_runtime_manager((config,))
-        self.face_detector = MNN.nn.load_module_from_file(
-            str(self.model_path),
-            ["image", "conf_threshold", "max_detections", "iou_threshold"],
-            ["selectedBoxes"],
-            runtime_manager=rt,
-        )
+        # print(model_path)
+        # Initialize MNN model
+        try:
+            config = {'precision': 'low', 'backend': 0, 'numThread': 4}
+            rt = MNN.nn.create_runtime_manager((config,))
+            self.face_detector = MNN.nn.load_module_from_file(
+                str(self.model_path),
+                ["image", "conf_threshold", "max_detections", "iou_threshold"],
+                ["selectedBoxes"],
+                runtime_manager=rt
+            )
+        except Exception as e:
+            raise e
 
         # Define vertex indices for lip and eye regions (kept for compatibility)
         self.lip_vertices_index = [61, 91, 14, 178, 402, 324, 95]
@@ -144,7 +146,7 @@ class BlazeFaceAlignment(FaceAlignment):
         face_info = FaceInfo()
         face_info.timestamp = timestamp
 
-        # Convert BGR to RGB (OpenCV default is BGR)
+        # Convert BGR to RGB
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image_height, image_width, _ = image.shape
         face_info.img_w = image_width
@@ -239,9 +241,11 @@ class BlazeFaceAlignment(FaceAlignment):
         #
         # face_info.face_landmarks = full_face_mesh
 
-        # Calculate eye openness (placeholder default)
-        face_info.left_eye_openness = 100
-        face_info.right_eye_openness = 100
+        # Calculate eye openness (simplified)
+        # Using the distance between eye centers as a proxy
+        eye_distance = math.sqrt((rey_cx - ley_cx) ** 2 + (rey_cy - ley_cy) ** 2)
+        face_info.left_eye_openness = 100 # Simplified
+        face_info.right_eye_openness = 100  # Simplified
 
         face_info.status = True
         face_info.can_gaze_estimation = True

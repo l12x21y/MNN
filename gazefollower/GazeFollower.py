@@ -6,7 +6,6 @@ import pathlib
 import re
 import shutil
 import threading
-import traceback
 
 import cv2
 import numpy as np
@@ -33,7 +32,7 @@ class GazeFollower:
 
     def __init__(self, camera: Camera = WebCamCamera(),
                  face_alignment: FaceAlignment = MediaPipeFaceAlignment(),
-                 gaze_estimator: GazeEstimator = None,
+                 gaze_estimator: GazeEstimator = MGazeNetGazeEstimator(),
                  gaze_filter: Filter = HeuristicFilter(),
                  calibration: Calibration = SVRCalibration(),
                  config: DefaultConfig = DefaultConfig()):
@@ -52,12 +51,7 @@ class GazeFollower:
         # eye tracking components
         self.camera: Camera = camera
         self.face_alignment: FaceAlignment = face_alignment
-        # 注意: 不能在类定义时把 MGazeNetGazeEstimator() 写成默认参数 —— Python 会在
-        # import 阶段就构造它, 而那时 Log.init() 还没被 _create_session 调用, 会抛
-        # "Logger has not been initialized"。改为在 __init__ 内部、_create_session 之后
-        # 再惰性构造, 既保证日志可用, 又避免多个 GazeFollower 共享同一个估计器实例。
-        self.gaze_estimator: GazeEstimator = (
-            gaze_estimator if gaze_estimator is not None else MGazeNetGazeEstimator())
+        self.gaze_estimator: GazeEstimator = gaze_estimator
         self.gaze_filter: Filter = gaze_filter
         self.calibration: Calibration = calibration
 
@@ -365,52 +359,37 @@ class GazeFollower:
                 gaze_info = self.gaze_estimator.detect(frame, face_info)
                 self._calibration_controller.add_cali_feature(gaze_info=gaze_info, face_info=face_info)
             elif not self._calibration_controller.cali_model_fitted:
-                # 健壮性修复: 若全程没收集到任何有效特征(例如摄像头未检测到人脸、
-                # 或推理失败), feature_vectors 为空, np.array([]) 的 shape 为 (0,),
-                # 下面 "n_point, n_frame, feature_dim = features.shape" 会直接 ValueError。
-                # 该异常原本被摄像头线程的 try/except 吞掉, 导致 cali_model_fitted
-                # 永远为 False, 主线程 draw_cali_result 的 while 死等 -> 校准卡死。
-                # 这里整体包 try/except: 任何失败都标记为"校准失败"并置
-                # cali_model_fitted=True, 让 UI 正常退出(显示 Calibration failed),
-                # 而不是冻结或崩溃。此修复与 MNN 后端(GPU/CPU)无关。
-                try:
-                    features = np.array(self._calibration_controller.feature_vectors)
-                    if features.size == 0:
-                        raise ValueError("未收集到任何有效校准特征")
-                    n_point, n_frame, feature_dim = features.shape
-                    print("feature shape: ", features.shape)
+                features = np.array(self._calibration_controller.feature_vectors)
+                n_point, n_frame, feature_dim = features.shape
+                print("feature shape: ", features.shape)
 
-                    features = np.reshape(features, (n_point * n_frame, feature_dim))
+                features = np.reshape(features, (n_point * n_frame, feature_dim))
 
-                    labels = np.array(self._calibration_controller.label_vectors)
-                    n_point, n_frame, label_dim = labels.shape
-                    labels = np.reshape(labels, (n_point * n_frame, label_dim))
-                    ids = np.array(self._calibration_controller.feature_ids)
-                    n_point, n_frame, ids_dim = ids.shape
-                    point_ids = np.reshape(ids, (n_point * n_frame, ids_dim))
+                labels = np.array(self._calibration_controller.label_vectors)
+                n_point, n_frame, label_dim = labels.shape
+                labels = np.reshape(labels, (n_point * n_frame, label_dim))
+                ids = np.array(self._calibration_controller.feature_ids)
+                n_point, n_frame, ids_dim = ids.shape
+                point_ids = np.reshape(ids, (n_point * n_frame, ids_dim))
 
-                    # timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    # features_path = f"features_{timestamp}.npz"
-                    # labels_path = f"labels_{timestamp}.npz"
-                    # point_ids_path = f"point_ids_{timestamp}.npz"
-                    #
-                    # np.savez_compressed(features_path, data=features)
-                    # np.savez_compressed(labels_path, data=labels)
-                    # np.savez_compressed(point_ids_path, data=point_ids)
-                    #
-                    # print(f"Features saved to: {features_path}")
-                    # print(f"Labels saved to: {labels_path}")
-                    # print(f"Point IDs saved to: {point_ids_path}")
+                # timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                # features_path = f"features_{timestamp}.npz"
+                # labels_path = f"labels_{timestamp}.npz"
+                # point_ids_path = f"point_ids_{timestamp}.npz"
+                #
+                # np.savez_compressed(features_path, data=features)
+                # np.savez_compressed(labels_path, data=labels)
+                # np.savez_compressed(point_ids_path, data=point_ids)
+                #
+                # print(f"Features saved to: {features_path}")
+                # print(f"Labels saved to: {labels_path}")
+                # print(f"Point IDs saved to: {point_ids_path}")
 
-                    has_calibrated, mean_euclidean_error, predictions \
-                        = self.calibration.calibrate(features, labels, point_ids)
+                has_calibrated, mean_euclidean_error, predictions \
+                    = self.calibration.calibrate(features, labels, point_ids)
 
-                    self._calibration_controller.set_calibration_results(has_calibrated, mean_euclidean_error, labels,
-                                                                         predictions)
-                except Exception as e:
-                    Log.e(f"校准拟合失败(将标记为失败, 不阻塞 UI): {e}")
-                    Log.e(traceback.format_exc())
-                    self._calibration_controller.cali_available = False
+                self._calibration_controller.set_calibration_results(has_calibrated, mean_euclidean_error, labels,
+                                                                     predictions)
                 self._calibration_controller.cali_model_fitted = True
 
         elif state == CameraRunningState.CLOSING:
@@ -456,40 +435,25 @@ class GazeFollower:
         self.calibration.release()
 
     @staticmethod
-    def _coord_pair(val):
-        """
-        Safely convert a 2-D coordinate array to two strings.
-        Returns ('NA', 'NA') when the value is None or malformed
-        (e.g. when face/gaze estimation failed for this frame).
-        """
-        if val is None:
-            return "NA", "NA"
-        try:
-            return f"{val[0]}", f"{val[1]}"
-        except Exception:
-            return "NA", "NA"
-
-    @staticmethod
     def _gaze_info_2_string(gaze_info: GazeInfo, trigger):
         """
         timestamp,datetime,raw_gaze_position_x,raw_gaze_position_y,
         calibrated_gaze_position_x,calibrated_gaze_position_y,
         filtered_gaze_position_x,filtered_gaze_position_y,
         left_eye_openness,right_eye_openness,tracking_status,status,event,trigger\n
+
+        timestamp : 电脑时钟(epoch 纳秒, 数字, 供下游可视化计算相对时间)
+        datetime  : 由 timestamp 转换的本地可读机械时间(年-月-日 时:分:秒.微秒)
         """
-        # timestamp is nanoseconds since epoch (computer wall-clock, from time.time_ns()).
-        # Also expose a human-readable local datetime for convenience.
-        if gaze_info.timestamp:
-            dt = datetime.datetime.fromtimestamp(gaze_info.timestamp / 1e9).strftime("%Y-%m-%d %H:%M:%S.%f")
-        else:
-            dt = "NA"
 
-        rx, ry = GazeFollower._coord_pair(gaze_info.raw_gaze_coordinates)
-        cx, cy = GazeFollower._coord_pair(gaze_info.calibrated_gaze_coordinates)
-        fx, fy = GazeFollower._coord_pair(gaze_info.filtered_gaze_coordinates)
+        # 将 epoch 纳秒转换为本地可读时间(电脑机械时间)
+        _dt = datetime.datetime.fromtimestamp(gaze_info.timestamp / 1e9)
+        _dt_str = _dt.strftime("%Y-%m-%d %H:%M:%S.%f")
 
-        ret_str = (f"{gaze_info.timestamp},{dt},"
-                   f"{rx},{ry},{cx},{cy},{fx},{fy},"
+        ret_str = (f"{gaze_info.timestamp},{_dt_str},"
+                   f"{gaze_info.raw_gaze_coordinates[0]},{gaze_info.raw_gaze_coordinates[1]},"
+                   f"{gaze_info.calibrated_gaze_coordinates[0]},{gaze_info.calibrated_gaze_coordinates[1]},"
+                   f"{gaze_info.filtered_gaze_coordinates[0]},{gaze_info.filtered_gaze_coordinates[1]},"
                    f"{gaze_info.left_openness},{gaze_info.right_openness},{gaze_info.tracking_state.value},"
                    f"{int(gaze_info.status)},{int(gaze_info.event.value)},{trigger}\n")
         return ret_str

@@ -19,22 +19,30 @@
 #   原始/校准后/滤波后 注视点像素坐标, 左右眼开合度, 追踪状态, 触发标记
 #
 # 流畅性设计原则:
+#   - 录制频率由 RECORD_HZ(默认 10Hz) 控制: 摄像头线程每 1/RECORD_HZ 秒才跑一次
+#     脸检测+眼动推理并写一条样本。录得越慢, 播放期被推理占用的 CPU/GIL 越少, 视频越流畅。
 #   - 播放视频期间【只记录数据】, 绝不做任何可视化(不渲染热力图、不拷贝视频帧作底图、
 #     不起后台渲染线程), 保证视频播放完全不卡顿。
 #   - 每帧显示用 pygame.image.frombuffer 直接封装 RGB 帧(不转置/不重建 surface)。
 #   - 设置 CAP_PROP_BUFFERSIZE=1 降低解码延迟, 并用 clock.tick(fps) 按原始帧率匀速播放。
-#   - 热力图等可视化全部在【数据记录完成之后】统一离线生成: 干净版直接由 CSV 统计得到;
-#     带视频画面版从目标视频按窗口中点时间抽取关键帧作底图(见 _generate_visualizations)。
+#   - 热力图等可视化全部在【数据记录完成之后】统一离线生成(见 main 末尾的
+#     _generate_visualizations): 干净版直接由 CSV 统计得到; 带视频画面版从目标视频按
+#     窗口中点时间抽取关键帧作底图。播放循环一结束就先 stop_sampling + save_data,
+#     整个播放期间没有任何可视化代码运行, 可视化不可能拖慢视频。
 #   - 该原则对 CPU / GPU 两套都生效; 差异只在 MNN 推理走 CPU 还是 GPU(见 USE_CPU/USE_GPU)。
 
-# ===================== CPU / GPU 切换（两套配置，二选一）=====================
+# ===================== CPU / GPU 切换（二选一）=====================
 # 把"要用的那一套"对应行的值改成 1，另一行改成 0。
-# 赋值为 1 的那一行生效：USE_GPU=1 走 Vulkan(GPU)；USE_CPU=1 走 CPU。
+#   USE_GPU=1 → MNN 眼动推理自动选择最佳 GPU 后端:
+#                优先 NVIDIA CUDA(6), 其次 Vulkan(4), 最后 OpenCL(2);
+#                若全不可用则回退 CPU(0)。
+#   USE_CPU=1 → 强制 CPU（backend=0）。
 # 注意: 此开关必须在 import GazeFollower 之前设置——GazeFollower 类定义时会
 #       构造默认的 MNN 估计器并读取该值决定走 CPU 还是 GPU。
-USE_CPU = 1     # CPU 套：MNN 推理走 CPU（backend=0）
-USE_GPU = 0     # GPU 套：MNN 推理走 Vulkan GPU（backend=4）。本机 OpenCL/CUDA 为伪 GPU、
-               # Vulkan 真实推理不稳(校准期易崩), 故默认退回 CPU, 视频流畅性由架构保证不受影响。
+#
+# 当前: CPU 模式 —— 先不考虑 GPU，确保实验可运行。
+USE_CPU = 1     # CPU 套：强制 MNN 推理走 CPU（backend=0）
+USE_GPU = 0     # GPU 套：MNN 自动探测最佳 GPU 后端（CUDA→Vulkan→OpenCL→CPU）。
 # ===========================================================================
 
 import os
@@ -47,26 +55,50 @@ import pygame
 from datetime import datetime
 from screeninfo import get_monitors
 
+# 限制 OpenCV 并行线程数: 避免视频解码和摄像头同时占用过多 CPU 线程,
+# 减轻与主线程的竞争。
+cv2.setNumThreads(1)
+
 # 必须在 import GazeFollower 之前确定后端：GazeFollower 类定义时会构造默认 MNN
 # 估计器，并读取 GAZEFOLLOWER_MNN_BACKEND 决定走 CPU 还是 GPU。
-if USE_GPU == 1 and USE_CPU != 1:
-    os.environ["GAZEFOLLOWER_MNN_BACKEND"] = "4"   # Vulkan GPU
-    _ACTIVE_SET = "GPU（Vulkan, backend=4）"
-elif USE_CPU == 1:
-    os.environ["GAZEFOLLOWER_MNN_BACKEND"] = "0"   # CPU
+if USE_CPU == 1 and USE_GPU != 1:
+    os.environ["GAZEFOLLOWER_MNN_BACKEND"] = "0"   # 强制 CPU
     _ACTIVE_SET = "CPU（backend=0）"
+elif USE_GPU == 1:
+    # 不设环境变量 → MGazeNetGazeEstimator 按 [6,4,2,0] 自动探测,
+    # 优先 NVIDIA CUDA backend=6, 其次 Vulkan(4)、OpenCL(2), 最后 CPU(0)。
+    # RTX 4060 上 CUDA 和 Vulkan 均应可用。
+    if "GAZEFOLLOWER_MNN_BACKEND" in os.environ:
+        del os.environ["GAZEFOLLOWER_MNN_BACKEND"]
+    _ACTIVE_SET = "GPU自动探测（CUDA→Vulkan→OpenCL→CPU）"
 else:
-    # 两套都置 1 或都置 0：保持自动选择（优先 GPU，回退 CPU）
-    _ACTIVE_SET = "自动（优先 GPU，回退 CPU）"
+    # 两套都置 1 或都置 0：自动选择（CUDA→Vulkan→OpenCL→CPU）
+    if "GAZEFOLLOWER_MNN_BACKEND" in os.environ:
+        del os.environ["GAZEFOLLOWER_MNN_BACKEND"]
+    _ACTIVE_SET = "GPU自动探测（CUDA→Vulkan→OpenCL→CPU）"
 
 from gazefollower import GazeFollower
+from gazefollower.camera import WebCamCamera
 from gazefollower.misc import DefaultConfig
 from make_heatmap import render_heatmap
 
 
 # ===================== 配置区(按需修改) =====================
 # 视频位置: 直接改这一行设置要播放的视频文件
-VIDEO_PATH = r"E:\HCI+\video\output\001.mp4"
+# 也可在命令行传参覆盖: python demo.py 你的视频路径.mp4
+# 若命令行未传参且默认路径不存在, 脚本会自动提示你输入路径。
+VIDEO_PATH = r"E:\HCI+\video\001.mp4"
+
+# 数据记录频率(Hz): 摄像头线程每 1/RECORD_HZ 秒只跑一次脸检测+眼动推理并写一条样本。
+# 当前 10Hz(每 0.1 秒一条)。该频率直接决定录制 CSV 的采样密度, 也是播放期 CPU/GIL
+# 占用的主要来源 —— 录得越慢, 留给主线程解码/显示视频的算力越多, 视频越流畅。
+# 若机器仍偏卡, 可再下调到 8 / 5 Hz; 若想更密的可视化, 可上调(代价是更占 CPU)。
+RECORD_HZ = 10
+
+# 摄像头采集分辨率(宽, 高)。越低 → MediaPipe 处理越快 → CPU 负担越小 → 视频越流畅。
+# 320x240 为最优平衡(MediaPipe 处理量仅为 640x480 的 1/4, 不影响校准精度)。
+# 若校准精度受影响可改回 (640, 480)。
+CAM_WIDTH, CAM_HEIGHT = 320, 240
 
 # 每隔多少秒生成一组热力图(默认 5 秒)
 WINDOW_SEC = 5
@@ -220,9 +252,27 @@ def _show_text_centered(screen, lines, font, color=(255, 255, 255), bg=(30, 30, 
     pygame.display.flip()
 
 
+def _resolve_video_path() -> str:
+    """确定视频路径：命令行参数 > VIDEO_PATH 配置 > 交互输入。"""
+    if len(sys.argv) > 1:
+        path = sys.argv[1]
+    elif os.path.isfile(VIDEO_PATH):
+        path = VIDEO_PATH
+    else:
+        print(f"[提示] 默认视频路径不存在：{VIDEO_PATH}")
+        path = input("请输入视频文件路径（直接回车跳过则不播放视频）: ").strip()
+        if not path:
+            print("[提示] 未指定视频，将以黑屏模式记录（仅录注视数据）。")
+            return ""
+    return path
+
+
 def main():
-    print(f"[模式] 当前 MNN 后端: {_ACTIVE_SET}")
-    video_path = sys.argv[1] if len(sys.argv) > 1 else VIDEO_PATH
+    print(f"[模式] 当前 MNN 后端: {_ACTIVE_SET}    |   采样频率: {RECORD_HZ} Hz")
+    video_path = _resolve_video_path()
+    if video_path and not os.path.isfile(video_path):
+        print(f"[警告] 视频文件不存在: {video_path}，将以黑屏模式记录。")
+        video_path = ""
 
     # 单屏: 始终使用主显示器(0 号)
     monitors = get_monitors()
@@ -234,7 +284,9 @@ def main():
     cfg.screen_size = np.array([W, H], dtype=np.int32)
 
     pygame.init()
-    gf = GazeFollower(config=cfg)
+    gf = GazeFollower(
+        camera=WebCamCamera(img_width=CAM_WIDTH, img_height=CAM_HEIGHT),
+        config=cfg)
 
     # 1) 校准(全屏, 按提示完成)
     print("Calibration...")
@@ -275,6 +327,9 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     out_csv = os.path.join(out_dir, f"{out_dir}.csv")
 
+    # 校准已完成, 录制前把摄像头的处理/记录频率降到 RECORD_HZ,
+    # 释放 CPU 给主线程的视频解码与显示
+    gf.camera.set_process_fps(RECORD_HZ)
     gf.start_sampling()
 
     cap = None

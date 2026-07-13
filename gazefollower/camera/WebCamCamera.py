@@ -30,11 +30,9 @@ class WebCamCamera(Camera):
         cap: cv2.VideoCapture
             The instance of cv2.VideoCapture and it can be None.
         process_fps : int
-            脸检测/眼动推理的最大频率(Hz)。摄像头线程仍按相机帧率读取最新帧,
-            但只在距上次处理超过 1/process_fps 秒时才跑一次预处理+回调(face/gaze),
-            把推理负载从相机帧率(约30Hz)降到约 process_fps(默认15Hz), 释放 CPU
-            给主线程的视频解码与显示, 避免播放卡顿。该限速与睁眼度/眨眼剔除无关,
-            不会影响校准质量。
+            摄像头线程每 1/process_fps 秒才跑一次脸检测+眼动推理并写一条样本。
+            该频率直接决定录制 CSV 的采样密度, 也是播放期 CPU/GIL 占用的主要来源。
+            默认 15Hz（校准用）；录制前可调用 set_process_fps() 调低到 10Hz 等。
         """
         super().__init__()
         self._camera_thread_running = None
@@ -44,8 +42,6 @@ class WebCamCamera(Camera):
         self.img_width = img_width
         self.cam_fps = cam_fps
         self.process_fps = process_fps
-        self._min_process_interval = 1.0 / max(process_fps, 1)
-        self._last_process_ts = 0
         self._cap = cv2.VideoCapture()
         # Set the camera resolution and frame rate.
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.img_width)
@@ -65,8 +61,12 @@ class WebCamCamera(Camera):
         """
         Continuously captures frames from the webcam while the camera is in specific running states.
         If a callback is set, it executes the callback function with the current frame.
+
+        频率控制: 每个处理周期后 sleep 以维持 process_fps, 从而控制录制采样密度,
+        并减少 CPU/GIL 占用（尤其播放视频期间, 留给主线程解码/显示视频更多算力）。
         """
         while self._camera_thread_running:
+            t0 = time.time()
             # Capture a frame from the webcam.
             ret, frame = self._cap.read()
             # Capture the current timestamp.
@@ -74,14 +74,6 @@ class WebCamCamera(Camera):
             if not ret:
                 Log.w("Failed to grab frame")
                 continue
-
-            # 限速: 跳过过密的中间帧, 把脸检测/眼动推理降到约 process_fps Hz。
-            # 仍在每个循环读取最新帧(OpenCV cap.read 直接返回当前帧, 不会积压),
-            # 只是被跳过的帧不跑昂贵的预处理与回调, 从而释放 CPU 给视频解码/显示,
-            # 避免播放卡顿。该跳过不影响睁眼度/眨眼剔除(校准质量保持当前状态)。
-            if (timestamp - self._last_process_ts) / 1e9 < self._min_process_interval:
-                continue
-            self._last_process_ts = timestamp
 
             # Check if the frame is in BGR format (default for OpenCV) and convert to RGB if necessary
             # Preprocessing image data
@@ -102,6 +94,15 @@ class WebCamCamera(Camera):
                 Log.e(str(e))
                 Log.e(f"Traceback:\n{traceback.format_exc()}")
 
+            # 频率控制: 维持 process_fps（处理一帧的耗时也算在内）
+            if self.process_fps and self.process_fps > 0:
+                dt = time.time() - t0
+                sleep_t = (1.0 / self.process_fps) - dt
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+                # 让出 GIL, 减轻与播放视频主线程的竞争
+                time.sleep(0)
+
     def open(self):
         """
         Opens the webcam if it is not already opened.
@@ -113,6 +114,16 @@ class WebCamCamera(Camera):
             raise Exception("Failed to open webcam camera")
         self._create_capture_thread()
 
+    def set_process_fps(self, fps: int):
+        """
+        设置摄像头线程的处理频率(Hz)。
+
+        该频率控制每 1/fps 秒跑一次脸检测+眼动推理并写一条样本, 即直接决定
+        录制 CSV 的采样密度。录制前调低(demo 中 RECORD_HZ=10)可释放更多 CPU
+        给视频播放, 保证流畅; 校准时可保持默认的较高值(15Hz)以更快采集样本。
+        """
+        self.process_fps = max(1, int(fps))
+
     def close(self):
         """
         Releases the webcam resources if the camera is currently opened.
@@ -121,9 +132,8 @@ class WebCamCamera(Camera):
         if self._camera_thread is not None:
             self._camera_thread_running = False
             self._camera_thread.join()
-        # 无论是否已 open(), release() 在 OpenCV 中都是安全的; 原来的
-        # "if not isOpened(): release()" 写反了, 会导致已打开的摄像头不被释放(泄漏)。
-        self._cap.release()
+        if not self._cap.isOpened():
+            self._cap.release()
 
     def set_on_image_callback(self, func, args=(), kwargs=None):
         """
@@ -140,10 +150,6 @@ class WebCamCamera(Camera):
         super().set_on_image_callback(func, args, kwargs)
 
     def release(self):
-        # 保护: 若摄像头从未 open()(线程未创建), 直接跳过 join, 避免
-        # AttributeError: 'NoneType' object has no attribute 'join'。
-        # 这样构造后直接 release / 初始化中途异常退出时也不会崩。
-        if self._camera_thread is not None:
-            self._camera_thread_running = False
-            self._camera_thread.join()
+        self._camera_thread_running = False
+        self._camera_thread.join()
         self.close()

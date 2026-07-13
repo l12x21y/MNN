@@ -13,7 +13,6 @@ import numpy as np
 from ..gaze_estimator import GazeEstimator
 from ..logger import Log
 from ..misc import FaceInfo, GazeInfo, TrackingState, clip_patch
-from ..mnn_probe import probe_all, load_module
 
 
 class MGazeNetGazeEstimator(GazeEstimator):
@@ -29,11 +28,6 @@ class MGazeNetGazeEstimator(GazeEstimator):
         Initialize the MGazeNetGazeEstimator.
 
         Loads the model weights and sets up the interpreter and session for inference.
-
-        后端自动选择: 优先 GPU(OpenCL=2, 否则 Vulkan=4), 该后端能通过"自检前向"且未
-        被 MNN 静默回退才使用, 否则回退 CPU(backend=0)。可用环境变量
-        GAZEFOLLOWER_MNN_BACKEND 强制指定 (0=CPU, 2=OpenCL, 4=Vulkan); 若指定的后端
-        不可用, 仍会自动回退到 CPU, 保证可用。
         """
         super().__init__()
 
@@ -43,48 +37,29 @@ class MGazeNetGazeEstimator(GazeEstimator):
         else:
             self.model_path = pathlib.Path(model_path).resolve()
 
-        # 输入张量尺寸(需在加载前定义, 供自检使用)
+        # Load model using MNN Module API
+        try:
+            # 读取环境变量 GAZEFOLLOWER_MNN_BACKEND (demo.py 中设置),
+            # 未设置时默认为 0 (CPU)
+            backend = int(os.environ.get("GAZEFOLLOWER_MNN_BACKEND", "0"))
+            # Create runtime configuration
+            config = {'precision': 'low', 'backend': backend, 'numThread': 4}
+            rt = MNN.nn.create_runtime_manager((config,))
+            # Load model with input and output names
+            self.gaze_module = MNN.nn.load_module_from_file(
+                str(self.model_path),
+                ["face", "left", "right", "rect"],  # Input names
+                ["output_0"],  # Output name
+                runtime_manager=rt
+            )
+
+        except Exception as e:
+            raise e
+
+        # Define input dimensions for model
         self.face_input_format = (1, 224, 224, 3)
         self.eye_input_format = (1, 112, 112, 3)
         self.rect_input_format = (1, 12)
-
-        # 自动选择后端: 优先 GPU(OpenCL=2, 其次 Vulkan=4), 失败回退 CPU(0)
-        # 先一次性子进程探测所有后端(probe_all 能识别 MNN "静默回退到 CPU" ——
-        # 部分纯 CPU 版 MNN 请求 OpenCL 时不报错, 只打印
-        # "Can't Find type=2 backend, use 0 instead" 然后偷偷用 CPU;
-        # 同理 Vulkan(4) 在缺少 ICD 时也会被静默回退),
-        # 再对选中的后端用 load_module 在进程内正式加载, 避免误报"正在使用 GPU"。
-        env_b = os.environ.get("GAZEFOLLOWER_MNN_BACKEND")
-        if env_b is not None:
-            candidates = [int(env_b)]
-            if int(env_b) != 0:
-                candidates.append(0)  # 强制指定非 CPU 后端失败时, 仍回退 CPU
-        else:
-            candidates = [2, 4, 0]   # OpenCL(GPU) -> Vulkan(GPU) -> CPU
-
-        probe = probe_all(self.model_path)
-        self.backend = None
-        last_err = None
-        for backend in candidates:
-            d = probe.get(backend)
-            if not d or not d["ok"] or d["fell_back"]:
-                last_err = (
-                    f"backend={backend} 探测未通过"
-                    + ("(被 MNN 静默回退到 CPU)" if d and d["fell_back"] else "")
-                )
-                Log.w(f"MNN 后端 {backend} 不可用, 尝试下一个: {last_err}")
-                continue
-            try:
-                self.gaze_module = load_module(backend, self.model_path)
-                self.backend = backend
-                Log.i(f"MGazeNet 使用后端 backend={backend} "
-                      f"({'GPU' if backend != 0 else 'CPU'})")
-                break
-            except Exception as e:
-                last_err = e
-                Log.w(f"MNN 后端 {backend} 加载失败, 尝试下一个: {e}")
-        if self.backend is None:
-            raise RuntimeError(f"MNN 所有候选后端均初始化失败: {last_err}")
 
         # Size definitions for face and eye patches
         self.face_size = (224, 224)
